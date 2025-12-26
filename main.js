@@ -57,6 +57,17 @@ async function getExpenses() {
   return allExpenses.rows;
 }
 
+/**
+ * Create and return a configured ChatOpenAI model instance.
+ *
+ * Configuration:
+ * - model: "gpt-4.1"
+ * - temperature: 0.7
+ * - maxTokens: 10000
+ * - API key read from `process.env.OPENAI_API_KEY`
+ *
+ * @returns {ChatOpenAI} Initialized ChatOpenAI instance
+ */
 function createModelInstance() {
   return new ChatOpenAI({
     model: "gpt-4.1",
@@ -66,6 +77,17 @@ function createModelInstance() {
   });
 }
 
+/**
+ * Build and return the prompt template used to instruct the model.
+ *
+ * The template expects the following variables:
+ * - `context`: formatted expenses or other context data
+ * - `question`: the user's question to answer
+ * - `format_instructions`: instructions for how the model should format
+ *    its output (used by structured parsers)
+ *
+ * @returns {ChatPromptTemplate} Prompt template for the LLM
+ */
 function createPromptTemplate() {
   return ChatPromptTemplate.fromTemplate(`Answer the user's question based on the context below.
     Context: {context}
@@ -82,6 +104,19 @@ function generateOutputParser() {
     });
 }
 
+/**
+ * Main orchestration function:
+ *
+ * Steps:
+ * 1. Retrieve expenses from the database.
+ * 2. Create and configure the LLM instance and prompt template.
+ * 3. Build a pipeline (prompt -> model -> output parser).
+ * 4. Encode the expenses into a compact format and invoke the chain with
+ *    a question and formatting instructions.
+ * 5. Log the structured AI response.
+ *
+ * @returns {Promise<void>}
+ */
 async function main() {
   const expenses = await getExpenses();
   const model = createModelInstance();
