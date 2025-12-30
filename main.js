@@ -1,100 +1,214 @@
-import { Pool } from "pg";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
-import { StructuredOutputParser } from "@langchain/core/output_parsers";
-import { encode } from '@toon-format/toon';
+import { RunnableSequence } from "@langchain/core/runnables";
+import { SqlDatabase } from "@langchain/classic/sql_db";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import { DataSource } from "typeorm";
 import * as dotenv from "dotenv";
+import * as readline from "readline/promises";
 
 dotenv.config();
 
-/**
- * Create and return a PostgreSQL connection pool using environment variables.
- * The function will create a `pg.Pool` instance and perform a simple test
- * query (`SELECT 1`) to validate connectivity before returning the pool.
- *
- * @returns {Promise<import('pg').Pool>} Connected PostgreSQL pool
+/*
+ * Scan the database schema and sample data to understand its structure using LLM. [SCAN]
+ * Pick and choose appropriate tables, the associated tables and then Generate the appropriate query as per the understanding of the user's question. [GENERATE]
+ * Execute on the database and return the results to the user as final answer for the prompt. [EXECUTE]
  */
-async function createDBConnection() {
-  const pool = new Pool({
-    host: process.env.PGHOST || process.env.DB_HOST || "localhost",
-    port: parseInt(process.env.PGPORT || process.env.DB_PORT || "5432", 10),
-    user: process.env.PGUSER || process.env.DB_USER,
-    password: process.env.PGPASSWORD || process.env.DB_PWD,
-    database: process.env.PGDATABASE || process.env.DB_NAME,
-    max: parseInt(process.env.PGPOOL_MAX || "10", 10),
-    idleTimeoutMillis: parseInt(process.env.PG_IDLE_TIMEOUT || "30000", 10),
-    ssl:
-      process.env.PGSSLMODE === "require" || process.env.PG_SSL === "true"
-        ? { rejectUnauthorized: false }
-        : undefined,
-  });
 
-  // Verify connection by running a simple query
-  try {
-    await pool.query("SELECT 1");
-  } catch (err) {
-    // If validation fails, clean up and rethrow for the caller to handle
-    await pool.end().catch(() => {});
-    throw err;
-  }
-
-  return pool;
-}
-
-async function getExpenses() {
-  let connPool = await createDBConnection();
-  const allExpenses = await connPool.query(`
-        SELECT expenses.amount, expenses.description, expenses.date AS expense_date, expenses.is_repayed, expenses.tag, 
-        payment_sources.name AS source_name, 
-        payment_methods.name AS method_name 
-        FROM expenses 
-        LEFT JOIN payment_sources ON expenses.source_id = payment_sources.id
-        LEFT JOIN payment_methods ON expenses.method_id = payment_methods.id 
-        WHERE expenses.is_deleted = 0 ORDER BY expenses.date DESC LIMIT 200;`);
-
-  console.log("\nallExpenses length:\n", allExpenses.rows.length);
-  await connPool.end();
-  return allExpenses.rows;
-}
-
-function createModelInstance() {
+/**
+ * Creates and returns an instance of the ChatOpenAI model.
+ * @returns {ChatOpenAI} An instance of the ChatOpenAI model.
+ */
+function getModelInstance() {
   return new ChatOpenAI({
-    model: "gpt-4.1",
+    model: "gpt-3.5-turbo",
     temperature: 0.7,
-    maxTokens: 10000,
+    maxTokens: 1000,
     apiKey: process.env.OPENAI_API_KEY,
   });
 }
 
-function createPromptTemplate() {
-  return ChatPromptTemplate.fromTemplate(`Answer the user's question based on the context below.
+/**
+ * Generates a prompt template for the ChatOpenAI model.
+ * @returns {ChatPromptTemplate} A prompt template for generating SQL queries.
+ */
+function generatePromptTemplate() {
+  return ChatPromptTemplate.fromTemplate(`
+    You are an expert database administrator and SQL developer. On the basis of the database schema and sample data provided in context, you need to generate the correct SQL query and execute the same to get the answer to the user's question.
+    You should only generate a SELECT query. DO NOT generate any other query like INSERT, UPDATE or DELETE. Politely refuse if the user asks for such queries.
+    If the user's question is not related to the database schema provided, politely inform them that you are only able to answer questions related to the source database.
+    Always ensure that the SQL query you generate is syntactically correct.
+    Never query any tables other than those mentioned in the context.
+    Provide only the final answer to the user's question without any additional commentary.
+    Current date/time (IST): {current_date_ist}
+    Current year (IST): {current_year}
     Context: {context}
-    Question: {question}
-    Answer Formatting Instructions: {format_instructions}`);
+    User's Question: {question}
+    If the user's question has any date, day, month, year or time related ask, ensure that you use the provided Current year (IST) and Current date/time (IST) while framing the sql query. DO NOT simply use the one as per the sample data from the sql server.
+    However, if the question is ambiguous, ask the user for clarification.
+    Answer:`);
 }
 
-function generateOutputParser() {
-    return StructuredOutputParser.fromNamesAndDescriptions({
-        total_amount: "Total amount of all expenses in INR",
-        highest_expense: "Highest expense details from the context",
-        lowest_expense: "Lowest expense details from the context",
-        count: "Number of expenses objects used from context to calculate the sum"
-    });
+/**
+ * Creates and returns a StringOutputParser instance.
+ * @returns {StringOutputParser} An instance of the StringOutputParser.
+ */
+function parseOutput() {
+  return new StringOutputParser();
 }
 
-async function main() {
-  const expenses = await getExpenses();
-  const model = createModelInstance();
-  const prompt = createPromptTemplate();
+/**
+ * Calculates the current date and time in IST (Indian Standard Time).
+ * @returns {{ istString: string, year: number }} An object containing the IST date/time string and the current year.
+ */
+function getCurrentIST() {
+  const now = new Date();
+  // convert local time to UTC, then add IST offset (UTC+5:30)
+  const nowUtc = new Date(now.getTime() + now.getTimezoneOffset() * 60000);
+  const istOffsetMs = 5.5 * 60 * 60 * 1000; // 5.5 hours
+  const istDate = new Date(nowUtc.getTime() + istOffsetMs);
+  const istString =
+    istDate.toISOString().replace("T", " ").slice(0, 19) + " IST";
+  const year = istDate.getFullYear();
+  return { istString, year };
+}
 
-  const chain = prompt.pipe(model).pipe(generateOutputParser());
-  const toonedExpenses = encode({ expenses });
-  const AIResponse = await chain.invoke({
-    context: toonedExpenses,
-    question: "What is the total amount of all of the expenses provided in the context in the month of november i.e. 11th month of this year? Use INR symbol.",
-    format_instructions: generateOutputParser().getFormatInstructions(),
+/**
+ * Sets up and returns a database source using TypeORM.
+ * @async
+ * @returns {Promise<SqlDatabase>} A configured SqlDatabase instance.
+ */
+async function setUpDatabaseSource() {
+  const datasource = new DataSource({
+    type: "postgres",
+    host: process.env.DB_HOST,
+    port: parseInt(process.env.DB_PORT, 10),
+    database: process.env.DB_NAME,
+    username: process.env.DB_USER,
+    password: process.env.DB_PWD,
+    synchronize: false,
+    logging: true,
   });
-  console.log("Retrieved AI response:", AIResponse);
+  const db = await SqlDatabase.fromDataSourceParams({
+    appDataSource: datasource,
+    ignoreTables: ["app_users"],
+    sampleRowsInTableInfo: 1,
+  });
+  return db;
 }
 
-await main();
+/**
+ * Retrieves the schema information of the database.
+ * @async
+ * @param {SqlDatabase} dbInstance - The database instance.
+ * @returns {Promise<Object>} The schema information of the database.
+ */
+async function getSchema(dbInstance) {
+  return await dbInstance.getTableInfo();
+}
+
+/**
+ * Creates a RunnableSequence for generating SQL queries.
+ * @param {ChatOpenAI} model - The ChatOpenAI model instance.
+ * @param {ChatPromptTemplate} prompt - The prompt template for generating SQL queries.
+ * @returns {RunnableSequence} A RunnableSequence for generating SQL queries.
+ */
+function getSQLQuery(model, prompt) {
+  return RunnableSequence.from([prompt, model]);
+}
+
+/**
+ * Executes the query and frames the final answer based on the database query result.
+ * @async
+ * @param {ChatOpenAI} model - The ChatOpenAI model instance.
+ * @param {string} question - The user's question.
+ * @param {Object} dbQueryAnswer - The result of the database query.
+ * @param {StringOutputParser} parser - The output parser instance.
+ * @returns {Promise<string>} The final answer to the user's question.
+ */
+async function executeQueryAndFrameAnswer(model, question, dbQueryAnswer, parser) {
+  const explanationPrompt = `
+      User Question:
+      ${question}
+
+      SQL Result:
+      ${JSON.stringify(dbQueryAnswer)}
+
+      Explain the result clearly and concisely.`;
+
+  return await model.pipe(parser).invoke(explanationPrompt);
+}
+
+/**
+ * Validates if the given SQL query is a safe SELECT statement.
+ * @param {string} sql - The SQL query to validate.
+ * @returns {boolean} True if the query is safe, false otherwise.
+ */
+function isSafeSelect(sql) {
+  const sqlString = sql.trim().toLowerCase();
+  if (!sqlString.startsWith("select")) return false; // If not starting with SELECT, it's unsafe
+  // Allow a single trailing semicolon, but forbid semicolons elsewhere
+  const semicolonMatch = sqlString.match(/;/g);
+  if (semicolonMatch && semicolonMatch.length > 1) return false;
+  if (semicolonMatch && !sqlString.endsWith(";")) return false;
+
+  const forbidden =
+    /(insert|update|delete|drop|alter|truncate|create|grant|--|\/\*)/;
+  // If any forbidden patterns are found, it's unsafe
+  return !forbidden.test(sqlString);
+}
+
+/**
+ * Main function to handle the user's question, generate SQL, execute it, and return the answer.
+ * @async
+ * @param {string} userQuestion - The user's database-related question.
+ * @returns {Promise<string>} The final answer to the user's question or an error message.
+ */
+async function main(userQuestion) {
+  try {
+    const model = getModelInstance();
+    const prompt = generatePromptTemplate();
+    const parser = parseOutput();
+    const dbInstance = await setUpDatabaseSource();
+    const schema = await getSchema(dbInstance);
+
+    const sqlGeneratorChain = getSQLQuery(model, prompt).pipe(parser);
+
+    const { istString, year } = getCurrentIST();
+
+    const sqlResponse = await sqlGeneratorChain.invoke({
+      context: schema,
+      question: userQuestion,
+      current_date_ist: istString,
+      current_year: year.toString(),
+    });
+
+    if (isSafeSelect(sqlResponse)) {
+      const dbQueryAnswer = await dbInstance.run(sqlResponse);
+      const finalAnswer = await executeQueryAndFrameAnswer(
+        model,
+        userQuestion + "Use INR symbol for denoting the value.",
+        dbQueryAnswer,
+        parser
+      );
+      return finalAnswer;
+    } else
+      return "Error: LLM Generated SQL query is not a safe SELECT statement.";
+
+  } catch (error) {
+    return `Error occurred: Unable to process the request. ${error.message}`;
+  }
+}
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
+
+const userQuestion = await rl.question(
+  "Please enter your database-related question: "
+);
+const answer = await main(userQuestion);
+rl.close();
+console.log("Answer: ", answer);
+process.exit(0);
