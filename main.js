@@ -39,6 +39,9 @@ function generatePromptTemplate() {
     If the user's question is not related to the database schema provided, politely inform them that you are only able to answer questions related to the source database.
     Always ensure that the SQL query you generate is syntactically correct.
     Never query any tables other than those mentioned in the context.
+    Generate only one SQL Query that's final and complete. If you believe that the SQL Query requires sub-query usage, then the final answer should not provide both the subquery and sql query separately, just one final query. Use exact column names as per the schema provided in context.
+    Use appropriate filtering, joins, aggregations, group by and order by clauses as per the user's question.
+    Always use single quotes for string literals in SQL queries.
     Provide only the final answer to the user's question without any additional commentary.
     Current date/time (IST): {current_date_ist}
     Current year (IST): {current_year}
@@ -126,7 +129,12 @@ function getSQLQuery(model, prompt) {
  * @param {StringOutputParser} parser - The output parser instance.
  * @returns {Promise<string>} The final answer to the user's question.
  */
-async function executeQueryAndFrameAnswer(model, question, dbQueryAnswer, parser) {
+async function executeQueryAndFrameAnswer(
+  model,
+  question,
+  dbQueryAnswer,
+  parser
+) {
   const explanationPrompt = `
       User Question:
       ${question}
@@ -146,16 +154,31 @@ async function executeQueryAndFrameAnswer(model, question, dbQueryAnswer, parser
  */
 function isSafeSelect(sql) {
   const sqlString = sql.trim().toLowerCase();
-  if (!sqlString.startsWith("select")) return false; // If not starting with SELECT, it's unsafe
-  // Allow a single trailing semicolon, but forbid semicolons elsewhere
+
+  // Ensure the query starts with SELECT
+  if (!sqlString.startsWith("select")) return false;
+
+  // Allow semicolons only at the end of the query
   const semicolonMatch = sqlString.match(/;/g);
-  if (semicolonMatch && semicolonMatch.length > 1) return false;
   if (semicolonMatch && !sqlString.endsWith(";")) return false;
 
+  // Check for forbidden keywords
   const forbidden =
     /(insert|update|delete|drop|alter|truncate|create|grant|--|\/\*)/;
-  // If any forbidden patterns are found, it's unsafe
   return !forbidden.test(sqlString);
+}
+
+/**
+ * Extracts the final SQL query from a response containing multiple queries.
+ * @param {string} sqlResponse - The SQL response string potentially containing multiple queries separated by semicolons.
+ * @returns {string} The last SQL query from the response, with a semicolon appended.
+ */
+function extractFinalQuery(sqlResponse) {
+  // Split the response into individual queries using semicolons
+  const queries = sqlResponse.split(';').map(query => query.trim()).filter(query => query.length > 0);
+
+  // Return the last query
+  return queries[queries.length - 1] + ';';
 }
 
 /**
@@ -183,8 +206,15 @@ async function main(userQuestion) {
       current_year: year.toString(),
     });
 
-    if (isSafeSelect(sqlResponse)) {
-      const dbQueryAnswer = await dbInstance.run(sqlResponse);
+    const sqlResponseFinal = extractFinalQuery(sqlResponse);
+
+    if (isSafeSelect(sqlResponseFinal)) {
+      let dbQueryAnswer = "";
+      dbQueryAnswer = await dbInstance.run(sqlResponseFinal);
+
+      if (!dbQueryAnswer)
+        return `Error: Failed to execute SQL query on the database and fetch the results.`;
+
       const finalAnswer = await executeQueryAndFrameAnswer(
         model,
         userQuestion + "Use INR symbol for denoting the value.",
@@ -193,8 +223,7 @@ async function main(userQuestion) {
       );
       return finalAnswer;
     } else
-      return "Error: LLM Generated SQL query is not a safe SELECT statement.";
-
+      return `Error: LLM Generated SQL query is not a safe SELECT statement.`;
   } catch (error) {
     return `Error occurred: Unable to process the request. ${error.message}`;
   }
