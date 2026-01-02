@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "description": "Generation of query, executing as per read schema using LLM",
   "main": "main.js",
-  "type":"module",
+  "type": "module",
   "dependencies": {
     "@langchain/classic": "^1.0.7",
     "@langchain/core": "^1.1.8",
     "@langchain/openai": "^1.2.0",
+    "@toon-format/toon": "^2.1.0",
     "abort-controller": "^3.0.0",
     "agentkeepalive": "^4.6.0",
     "ansi-regex": "^6.2.2",
