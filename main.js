@@ -6,6 +6,7 @@ import { StringOutputParser } from "@langchain/core/output_parsers";
 import { DataSource } from "typeorm";
 import * as dotenv from "dotenv";
 import * as readline from "readline/promises";
+import { encode } from '@toon-format/toon';
 
 dotenv.config();
 
@@ -211,6 +212,15 @@ async function main(userQuestion) {
     if (isSafeSelect(sqlResponseFinal)) {
       let dbQueryAnswer = "";
       dbQueryAnswer = await dbInstance.run(sqlResponseFinal);
+      
+      if (dbQueryAnswer)
+        if (
+          Array.isArray(JSON.parse(dbQueryAnswer)) &&
+          JSON.parse(dbQueryAnswer).length > 1
+        ) {
+          // Toonifying the context if the number of the rows is more than 1
+          dbQueryAnswer = encode({ expenses_data: JSON.parse(dbQueryAnswer) });
+        }
 
       if (!dbQueryAnswer)
         return `Error: Failed to execute SQL query on the database and fetch the results.`;
